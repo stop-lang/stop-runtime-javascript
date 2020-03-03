@@ -11,8 +11,8 @@ function StopRuntime(stop, implementation){
 	this.orderedStates = [];
 	this.packageImplementations = {};
 	this.packageImplementationRuntimeImplementationExecution = {
-		queue: function(implementationInstance){
-            this.packageImplementationRuntimeImplementationExecutionQueue(implementationInstance);
+		queue: function(implementationInstance, resolve, reject){
+            this.packageImplementationRuntimeImplementationExecutionQueue(implementationInstance, resolve, reject);
 		},
 		log: function(message){
             this.packageImplementationRuntimeImplementationExecutionLog(message);
@@ -21,42 +21,48 @@ function StopRuntime(stop, implementation){
 }
 StopRuntime.prototype.constructor = StopRuntime;
 
-StopRuntime.prototype.start = function(toImplementationInstance) {
+StopRuntime.prototype.start = function(toImplementationInstance, resolve, reject) {
     var to = this.implementation.buildStateInstance(toImplementationInstance);
-    return this.startInstance(to);
+    this.startInstance(to, resolve, reject);
 };
 
-StopRuntime.prototype.queue = function(implementationInstance) {
+StopRuntime.prototype.queue = function(implementationInstance, resolve, reject) {
     if (this.currentStateInstance == null){
-        throw new StopRuntimeException("No current state instance");
+        reject(new StopRuntimeException("No current state instance"));
+        return;
     }
 
     var queue = this.implementation.buildStateInstance(implementationInstance);
 
     if (queue == null){
-        throw new StopRuntimeException("queue state instance must be defined");
+        reject( new StopRuntimeException("queue state instance must be defined"));
+        return;
     }
 
     var queueState = this.currentStateInstance.state.enqueues[queue.state.name];
 
     if (queueState == null){
-        throw new StopRuntimeException("Could not find queue " + queue.state.name);
+        reject( new StopRuntimeException("Could not find queue " + queue.state.name));
+        return;
     }
 
     if(!queueState.isQueue()){
-        throw new StopRuntimeException("Invalid queue state");
+        reject( new StopRuntimeException("Invalid queue state"));
+        return;
     }
 
     queue.validateProperties(false);
 
     this.implementation.enqueue(implementationInstance);
+
+    resolve();
 };
 
 StopRuntime.prototype.log = function(message){
     this.implementation.log(message);
 };
 
-StopRuntime.prototype.addPackageImplementation = function(packageName, packageImplementation ){
+StopRuntime.prototype.addPackageImplementation = function(packageName, packageImplementation){
     this.packageImplementations[packageName] = packageImplementation;
 };
 
@@ -64,73 +70,76 @@ StopRuntime.prototype.removePackageImplementation = function(packageName){
     this.packageImplementations[packageName] = undefined;
 };
 
-StopRuntime.prototype.startInstance = function(to) {
-    orderedStates = [];
+StopRuntime.prototype.startInstance = function(to, resolve, reject) {
+    this.orderedStates = [];
 
     if (to == null){
-        throw new StopRuntimeException("To state instances must be defined");
+        reject(new StopRuntimeException("To state instances must be defined"));
+        return;
     }
 
     if (!to.state.start && !to.state.queue){
-        throw new StopRuntimeException("Invalid start state");
+        reject(new StopRuntimeException("Invalid start state"));
+        return;
     }
 
-    var resultInstance = this.execute(to);
-
-    if (resultInstance!=null){
-        if (!resultInstance.state.stop){
-            throw new StopRuntimeException(resultInstance.state.name  + " is not a stopping state!");
-        }
-        return this.implementation.buildImplementationInstance(resultInstance);
-    }
-
-    throw new StopRuntimeException("No ending state!");
+    var runtime = this;
+    this.execute(to, 
+        function(resultInstance){
+            if (resultInstance!=null){
+                if (!resultInstance.state.stop){
+                    reject(new StopRuntimeException(resultInstance.state.name  + " is not a stopping state!"));
+                }else{
+                    resolve(runtime.implementation.buildImplementationInstance(resultInstance));
+                }
+            }else{
+                reject(new StopRuntimeException("No ending state!"));
+            }
+        },
+        reject
+    );
 };
 
-StopRuntime.prototype.execute = function(stateInstance) {
-    try {
-        this.gatherDynamicProperties(stateInstance);
-    }catch(errorException){
-        var errorState = errorException.errorStateInstance;
-        var contextState = errorException.contextStateInstance;
+StopRuntime.prototype.execute = function(stateInstance, resolve, reject) {
+    var runtime = this;
+    this.gatherDynamicProperties(stateInstance, function(resolvedStateInstance){
+        resolvedStateInstance.validateProperties();
 
-        if (errorState == null){
-            throw new StopRuntimeException("Error state was undefined in StopRuntimeErrorException during dynamic property gathering");
+        runtime.currentStateInstance = resolvedStateInstance;
+
+        runtime.orderedStates.push(resolvedStateInstance);
+
+        var implementationInstance = runtime.implementation.buildImplementationInstance(resolvedStateInstance);
+
+        if (resolvedStateInstance.state.returnType){
+            runtime.executeWithPackageImplementations(implementationInstance, 
+            function(value){
+                if(value == undefined){
+                    value = null;
+                }
+                resolve(resolvedStateInstance, value);
+            },
+            reject);
+        }else{
+            runtime.executeWithPackageImplementations(implementationInstance, 
+            function(nextImplementationInstance){
+                if (nextImplementationInstance != null) {
+                    var nextStateInstance = runtime.implementation.buildStateInstance(nextImplementationInstance);
+                    runtime.transition(resolvedStateInstance, nextStateInstance, resolve, reject);
+                } else {
+                    resolve(resolvedStateInstance);
+                }
+            },
+            reject);
         }
-
-        if (contextState == null){
-            throw new StopRuntimeException("Context state was undefined in StopRuntimeErrorException during dynamic property gathering");
-        }
-
-        return this.transition(contextState, errorState);
-    }
-
-    stateInstance.validateProperties();
-
-    this.currentStateInstance = stateInstance;
-
-    this.orderedStates.push(stateInstance);
-
-    var implementationInstance = this.implementation.buildImplementationInstance(stateInstance);
-
-    try {
-        var nextImplementationInstance = this.executeWithPackageImplementations(implementationInstance);
-
-        if (nextImplementationInstance != null) {
-            var nextStateInstance = this.implementation.buildStateInstance(nextImplementationInstance);
-            return this.transition(stateInstance, nextStateInstance);
-        } else {
-            return stateInstance;
-        }
-    } catch (errorException) {
-        var errorStateInstance = errorException.errorStateInstance;
-        return this.transition(stateInstance, errorStateInstance);
-    }
+    },
+    reject);
 };
 
-StopRuntime.prototype.transition = function(from, to) {
+StopRuntime.prototype.transition = function(from, to, resolve, reject) {
     if (from == null || to == null){
-        throw new StopRuntimeException("From and to state instances must be defined");
+        reject(new StopRuntimeException("From and to state instances must be defined"));
+        return;
     }
 
     from.validateProperties();
@@ -139,97 +148,108 @@ StopRuntime.prototype.transition = function(from, to) {
     var transitionState = from.state.transitions[to.state.name];
 
     if ((errorState == null) && (transitionState == null)){
-        throw new StopRuntimeException("Could not find state to transition to called " + to.state.name);
+        reject(new StopRuntimeException("Could not find state to transition to called " + to.state.name));
+        return;
     }
 
-    return this.execute(to);
+    this.execute(to, resolve, reject);
 };
 
-StopRuntime.prototype.gatherDynamicProperties = function(to) {
-    var orderedDynamicProperties = to.state.getOrderedProperties();
+StopRuntime.prototype.gatherDynamicProperty = function(to, property, resolve, reject){
+    if (property && (property.providerState != null)){
+        var providerState = property.providerState;
+        if (property.optional && !this.shouldMapProvider(to, property, providerState)){
+            resolve(to);
+            return;
+        }
+        var providerStateInstance = this.mapStateInstancePropertiesToProvider(to, providerState, property.providerStateMapping);
+        var self = this;
+        this.gatherDynamicProperties(providerStateInstance, function(resolvedProviderStateInstance){
+            resolvedProviderStateInstance.validateProperties();
+            var providerImplementationInstance = self.implementation.buildImplementationInstance(resolvedProviderStateInstance);
 
-    for (var i in orderedDynamicProperties){
-        var property = orderedDynamicProperties[i];
-        if (property != null){
-            if (property.providerState != null){
-                var providerState = property.providerState;
-                if (property.optional && !this.shouldMapProvider(to, property, providerState)){
-                    continue;
-                }
-                var providerStateInstance = this.mapStateInstancePropertiesToProvider(to, providerState, property.providerStateMapping);
-                this.gatherDynamicProperties(providerStateInstance);
-                providerStateInstance.validateProperties();
-                var providerImplementationInstance = this.implementation.buildImplementationInstance(providerStateInstance);
-
-                try {
-                    var value = null;
-
-                    if (providerState.returnCollection) {
-                        var collection = this.executeAndReturnCollectionWithPackageImplementations(providerImplementationInstance);
-
-                        if (providerState.returnState != null) {
-                            var stateInstances = [];
-                            if(collection!=null) {
-                                for (var j in collection) {
-                                    var collectionElement = collection[j];
-                                    var si = this.implementation.buildStateInstance(collectionElement);
-                                    stateInstances.push(si);
-                                }
+            if (providerState.returnCollection) {
+                self.executeAndReturnCollectionWithPackageImplementations(providerImplementationInstance, function(collection){
+                    if (providerState.returnState != null) {
+                        var stateInstances = [];
+                        if(collection!=null) {
+                            for (var j in collection) {
+                                var collectionElement = collection[j];
+                                var si = self.implementation.buildStateInstance(collectionElement);
+                                stateInstances.push(si);
                             }
-                            value = stateInstances;
-                        } else {
-                            value = collection;
+
+                            var nextCollectionItem = function(stateInstanceCollection, index, resolve, reject){
+                                var item = stateInstanceCollection[index];
+                                self.gatherDynamicProperties(item, function(resolvedStateInstance){
+                                    stateInstanceCollection[index] = resolvedStateInstance;
+                                    if ((index+1) < stateInstanceCollection.length){
+                                        nextCollectionItem(stateInstanceCollection, index+1, resolve, reject);
+                                    } else {
+                                        to.properties[property.name] = stateInstanceCollection;
+                                        resolve(to);
+                                    }
+                                }, reject);
+                            };
+
+                            nextCollectionItem(stateInstances, 0, resolve, reject);
+                        }else {
+                            to.properties[property.name] = stateInstances;
+                            resolve(to);
                         }
                     } else {
-                        var returnValue = this.executeAndReturnValueWithPackageImplementations(providerImplementationInstance);
-
-                        if (returnValue!=null) {
-                            if (providerState.returnState != null) {
-                                value = this.implementation.buildStateInstance(returnValue);
-                            } else {
-                                value = returnValue;
-                            }
+                        to.properties[property.name] = collection;
+                        resolve(to);
+                    }
+                }, reject);
+            } else {
+                self.executeAndReturnValueWithPackageImplementations(providerImplementationInstance, function(returnValue){
+                    var value = null;
+                    if (returnValue!=null) {
+                        if (providerState.returnState != null) {
+                            value = self.implementation.buildStateInstance(returnValue);
+                        } else {
+                            value = returnValue;
                         }
                     }
 
-                    if (value != null) {
-                        if (value instanceof Array){
-                            var instances = value;
-                            for (var k in instances){
-                                var instance = instances[k];
-                                if (instance instanceof stop.Stop.models.StateInstance){
-                                    this.gatherDynamicProperties(instance);
-                                }
-                            }
-                        }else if(value instanceof stop.Stop.models.StateInstance){
-                            this.gatherDynamicProperties(value);
-                        }
+                    if ((value != null) && (value instanceof stop.Stop.models.StateInstance)){
+                        self.gatherDynamicProperties(value, function(resolvedValue){
+                            to.properties[property.name] = value;
+                            resolve(to); 
+                        }, 
+                        reject);
+                    }else{
                         to.properties[property.name] = value;
+                        resolve(to); 
                     }
-                }catch(errorException){
-                    throw new StopRuntimeErrorException(errorException.errorStateInstance, providerStateInstance);
-                }
+                }, reject);
             }
-        }
+        }, reject);
+    }else{
+        resolve(to);
     }
+};
 
-    for ( var key in to.properties ){
-        var value = to.properties[key];
-        if (value != null){
-            if (value instanceof Array){
-                var instances = value;
-                for (var i in instances){
-                    var instance = instances[i];
-                    if (instance instanceof stop.Stop.models.StateInstance){
-                        var collectionStateInstance = instance;
-                        this.gatherDynamicProperties(collectionStateInstance);
-                    }
-                }
-            } else if (value instanceof stop.Stop.models.StateInstance){
-                var propertyStateInstance = value;
-                this.gatherDynamicProperties(propertyStateInstance);
-            }
+StopRuntime.prototype.nextProperty = function(orderedDynamicProperties, index, to, resolve, reject){
+    var property = orderedDynamicProperties[index];
+    var runtime = this;
+    this.gatherDynamicProperty(to, property, function(resolvedStateInstance){
+        if ((index+1) < orderedDynamicProperties.length){
+            runtime.nextProperty(orderedDynamicProperties, index+1, resolvedStateInstance, resolve, reject);
+        } else{
+            resolve(resolvedStateInstance);
         }
+    }, reject);
+};
+
+StopRuntime.prototype.gatherDynamicProperties = function(to, resolve, reject) {
+    var orderedDynamicProperties = to.state.getOrderedProperties();
+
+    if (orderedDynamicProperties.length == 0){
+        resolve(to);
+    }else{
+        this.nextProperty(orderedDynamicProperties, 0, to, resolve, reject);
     }
 }
 
@@ -317,7 +337,7 @@ StopRuntime.prototype.shouldMapProvider = function(stateInstance, stateInstanceP
     return true;
 };
 
-StopRuntime.prototype.executeWithPackageImplementations = function(implementationInstance)  {
+StopRuntime.prototype.executeWithPackageImplementations = function(implementationInstance, resolve, reject)  {
     if (this.packageImplementations.length > 0){
         var stateInstance = this.implementation.buildStateInstance(implementationInstance);
         var stateName = stateInstance.state.name;
@@ -325,19 +345,28 @@ StopRuntime.prototype.executeWithPackageImplementations = function(implementatio
         for (var key in this.packageImplementations){
             var packageImplementation = this.packageImplementations[key];
             if (stateName.startsWith(key+REFERENCE_DELIMETER)){
-                var returnStateInstance = packageImplementation.execute(stateInstance, this.packageImplementationRuntimeImplementationExecution);
-                if (returnStateInstance!=null) {
-                    return this.implementation.buildImplementationInstance(returnStateInstance);
-                }
-                return null;
+                var runtime = this;
+                packageImplementation.execute(stateInstance, this.packageImplementationRuntimeImplementationExecution, 
+                    function(returnStateInstance){
+                        if (returnStateInstance!=null) {
+                            resolve(runtime.implementation.buildImplementationInstance(returnStateInstance));
+                        }else{
+                            resolve(null);
+                        }
+                    },
+                    function(error){
+                        reject(error);
+                    }
+                );
+                return;
             }
         }
     }
 
-    return this.implementation.execute(implementationInstance, this);
+    this.implementation.execute(implementationInstance, this, resolve, reject);
 };
 
-StopRuntime.prototype.executeAndReturnValueWithPackageImplementations = function(implementationInstance) {
+StopRuntime.prototype.executeAndReturnValueWithPackageImplementations = function(implementationInstance, resolve, reject) {
     if (this.packageImplementations.length > 0){
         var stateInstance = this.implementation.buildStateInstance(implementationInstance);
         var stateName = stateInstance.state.name;
@@ -345,33 +374,33 @@ StopRuntime.prototype.executeAndReturnValueWithPackageImplementations = function
         for (var key in this.packageImplementations){
             var packageImplementation = this.packageImplementations[key];
             if (stateName.startsWith(key+REFERENCE_DELIMETER)){
-                var returnObject = packageImplementation.executeAndReturnValue(stateInstance, this.packageImplementationRuntimeImplementationExecution);
-                return returnObject;
+                packageImplementation.executeAndReturnValue(stateInstance, this.packageImplementationRuntimeImplementationExecution, resolve, reject);
+                return;
             }
         }
     }
 
-    return this.implementation.executeAndReturnValue(implementationInstance, this);
+    this.implementation.executeAndReturnValue(implementationInstance, this, resolve, reject);
 };
 
-StopRuntime.prototype.executeAndReturnCollectionWithPackageImplementations = function(implementationInstance) {
-    if (!this.packageImplementations.isEmpty()){
+StopRuntime.prototype.executeAndReturnCollectionWithPackageImplementations = function(implementationInstance, resolve, reject) {
+    if (this.packageImplementations.length > 0){
         var stateInstance = this.implementation.buildStateInstance(implementationInstance);
         var stateName = stateInstance.state.name;
         for (var key in this.packageImplementations){
             var packageImplementation = this.packageImplementations[key];
             if (stateName.startsWith(key+REFERENCE_DELIMETER)){
-                var returnCollection = packageImplementation.getValue().executeAndReturnCollection(stateInstance, this.packageImplementationRuntimeImplementationExecution);
-                return returnCollection;
+                packageImplementation.getValue().executeAndReturnCollection(stateInstance, this.packageImplementationRuntimeImplementationExecution, resolve, reject);
+                return;
             }
         }
     }
 
-    return this.implementation.executeAndReturnCollection(implementationInstance, this);
+    this.implementation.executeAndReturnCollection(implementationInstance, this, resolve, reject);
 };
 
-StopRuntime.prototype.packageImplementationRuntimeImplementationExecutionQueue = function(stateInstance) {
-    this.queue(this.implementation.buildImplementationInstance(stateInstance));
+StopRuntime.prototype.packageImplementationRuntimeImplementationExecutionQueue = function(stateInstance, resolve, reject) {
+    this.queue(this.implementation.buildImplementationInstance(stateInstance), resolve, reject);
 };
 
 StopRuntime.prototype.packageImplementationRuntimeImplementationExecutionLog = function(message) {
